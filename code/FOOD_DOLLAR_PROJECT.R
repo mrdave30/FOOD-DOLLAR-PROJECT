@@ -830,16 +830,9 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
       output_final <- file.path(base_dir, paste0(year, "_", type, "_IOT.csv"))
       write_csv(merged_va_t_fd, output_final)
       message("Updated input-output table with country and industry column names saved as: ", output_final)
-        
+       
+      #Pivot the whole dataset into long formaty as required
       merged_va_t_fd <- merged_va_t_fd %>%
-        # select(-c(ROW_YPCE,
-        #           ROW.1_YPCE,
-        #           ROW.2_YGOV,
-        #           ROW.3_YINV,
-        #           ROW.4_YINV)) %>% 
-        
-        
-        #remove rest of the world
       pivot_longer(
           cols = -c(
             Industry,
@@ -856,7 +849,8 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
                ) %>%
         select(YEAR, COUNTRY, ROW, COL, var5) %>%
         mutate(var5 = round(var5, 2)) %>% 
-        filter(var5 != 0) %>% 
+        filter(var5 != 0,
+               COL != "Agriculture") %>% 
         rowwise() %>%
         mutate(
           COL = case_when(
