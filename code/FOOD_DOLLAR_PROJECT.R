@@ -6,10 +6,13 @@ library(dplyr)
 library(stringr)
 library(tidyverse)
 library(janitor)
+library(readxl)
+library(haven)
+
 
 # Define the directory
 base_dir <- "C:\\Users\\Nkoro\\Food and Agriculture Organization\\ESSDC - Data Generation and Capacity Building WorkSpace - EORA data\\Eora26\\test"
-
+setwd(base_dir)
 # List all folders in the directory
 folders <- dir_ls(base_dir, type = "directory")
 
@@ -195,7 +198,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
                           "Wholesale Trade", "Retail Trade", "Hotels and Restaurants", "Transport", 
                           "Post and Telecommunications", "Financial Intermediation and Business Activities", 
                           "Public Administration", "Education, Health and Other Services", "Private Households", 
-                          "Others", "Re-export & Re-import")
+                          "Others", "Re-export & Re-import") # compare the categories with the industry codes
           
           colnames(reshaped_data)[-(1:3)] <- paste(colnames(reshaped_data)[-(1:3)], "TZ", sep = "_")
           
@@ -348,12 +351,25 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         mutate(gross_output_xout = rowSums(across(where(is.numeric)), na.rm = TRUE)) %>%
         mutate(gross_output_xout = ifelse(row_number() > 4915, 0, gross_output_xout))
 
-      # Identify TZ and Final Demand (FD) columns
+      # Identify TZ and Final Demand (FD) columns 
       tz_columns <- grep("TZ", colnames(merged_va_t_fd), value = TRUE)
       final_demand_columns <- grep("Final_demand", colnames(merged_va_t_fd), value = TRUE)
+      
 
       # Adjust merged data (set final demand columns to zero after row 26)
       merged_va_t_fd[4916:nrow(merged_va_t_fd), final_demand_columns] <- 0
+      
+      # #to be removed after 
+      # merged_va_t_fd <- merged_va_t_fd %>%
+      #   group_by(country) %>%
+      #   mutate(total_grossoutput = sum(gross_output_xout, na.rm = TRUE)) %>%
+      #   ungroup() %>%
+      #   mutate(share_grossoutput = (gross_output_xout / total_grossoutput) * 100)
+      # 
+      # # Save merged VA and T data
+      # output_merged_va_t <- file.path(base_dir, paste0(year, "_", type, "_merged_va_t.csv"))
+      # write_csv(merged_va_t_fd, output_merged_va_t)
+      # message("Merged VA-T dataset saved as: ", output_merged_va_t)
 
       #Define the RAS algorithm
       ras_algorithm <- function(matrix, target_row_sums, target_col_sums,
@@ -366,13 +382,13 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         for (i in 1:max_iter) {
           # Update rows
           row_sums <- rowSums(matrix)
-          row_sums[row_sums == 0] <- 1  
+          row_sums[row_sums == 0] <- 1
           R <- target_row_sums / row_sums
           matrix <- diag(R) %*% matrix
 
           # Update columns
           col_sums <- colSums(matrix)
-          col_sums[col_sums == 0] <- 1  
+          col_sums[col_sums == 0] <- 1
           S <- target_col_sums / col_sums
 
           # Ensure conformable matrices
@@ -389,60 +405,90 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         return(matrix)
       }
 
-      
+
       #Apply RAS to the TZ columns
       #Extract the TZ columns and convert to matrix
       TZ_matrix <- as.matrix(merged_va_t_fd[, tz_columns])
-
+      
       # Target row sums are the original row sums (merged_va_t_fd$gross_output_xout)
       # and column sums are the first n TZ columns of gross_output_xout
       target_row_sums <- merged_va_t_fd$gross_output_xout
       target_col_sums_TZ <- merged_va_t_fd$gross_output_xout[1:ncol(TZ_matrix)]
-
+      
       # Apply the RAS algorithm to adjust TZ columns
       adjusted_TZ_matrix <- ras_algorithm(TZ_matrix, rowSums(TZ_matrix), target_col_sums_TZ)
+      
+      # ......Retain the original signs......
+      adjusted_TZ_matrix <- sign(TZ_matrix) * abs(adjusted_TZ_matrix)
 
       # Update the dataframe with adjusted TZ columns
       merged_va_t_fd[, tz_columns] <- adjusted_TZ_matrix
 
-      #Adjust the FD columns to match the residuals after TZ adjustment
-      FD_matrix <- as.matrix(merged_va_t_fd[, final_demand_columns])
-
-      # Residual row sums after adjusting TZ matrix
+      #Calculate residuals after TZ adjustment
       residual_row_sums <- target_row_sums - rowSums(adjusted_TZ_matrix)
-
-      # Adjust FD matrix proportionally based on the residuals
-      FD_row_sums <- rowSums(FD_matrix)
-      scaling_factors <- ifelse(FD_row_sums == 0, 0, residual_row_sums / FD_row_sums)
-      adjusted_FD_matrix <- diag(scaling_factors) %*% FD_matrix
       
-      # Update the dataframe with adjusted FD columns
+      FD_matrix <- as.matrix(merged_va_t_fd[, final_demand_columns])
+      FD_row_sums <- rowSums(FD_matrix)
+      
+      # Store the original FD_matrix for applying constraints later
+      original_FD_matrix <- FD_matrix
+      
+      # Separate positive and negative components
+      FD_positive <- FD_matrix
+      FD_negative <- FD_matrix
+      
+      # Set negative values in the positive matrix to 0
+      FD_positive[FD_matrix < 0] <- 0
+      
+      # Set positive values in the negative matrix to 0
+      FD_negative[FD_matrix > 0] <- 0
+      
+      #Compute scaling factors for positive and negative components
+      positive_row_sums <- rowSums(FD_positive)
+      negative_row_sums <- rowSums(FD_negative)
+      
+      scaling_factors_positive <- ifelse(
+        positive_row_sums == 0 & residual_row_sums == 0,
+        1,
+        ifelse(
+          positive_row_sums == 0,
+          0,
+          residual_row_sums / (positive_row_sums + negative_row_sums)
+        )
+      )
+      
+      scaling_factors_negative <- ifelse(
+        positive_row_sums == 0 & residual_row_sums != 0,
+        residual_row_sums / negative_row_sums,  # Distribute residual proportionally among negative values
+        residual_row_sums / (positive_row_sums + negative_row_sums)   # Normal scaling
+      )
+      
+      # Avoid division by zero for negative_row_sums == 0
+      scaling_factors_negative[negative_row_sums == 0] <- 1
+      
+      #Scale positive and negative components while retaining signs
+      adjusted_FD_positive <- diag(scaling_factors_positive) %*% FD_positive
+      adjusted_FD_negative <- diag(scaling_factors_negative) %*% FD_negative
+      
+      # Combine adjusted positive and negative parts
+      adjusted_FD_matrix <- adjusted_FD_positive + adjusted_FD_negative
+      
+      # Apply the -/+ 2% constraint
+      constraint <- 0.02 
+      
+      adjusted_FD_matrix <- pmax(adjusted_FD_matrix, original_FD_matrix * (1 - constraint))
+      adjusted_FD_matrix <- pmin(adjusted_FD_matrix, original_FD_matrix * (1 + constraint))
+      
+      # Retain the original signs
+      adjusted_FD_matrix <- sign(FD_matrix) * abs(adjusted_FD_matrix)
+      
+      # Update the FD matrix in the dataset
       merged_va_t_fd[, final_demand_columns] <- adjusted_FD_matrix
       
-      #Difference between original and adjusted matrices
-      # Calculate the difference for TZ columns
-      TZ_diff_matrix <- TZ_matrix - adjusted_TZ_matrix
-      
-      # Calculate the difference for FD columns
-      FD_diff_matrix <- FD_matrix - adjusted_FD_matrix
-      
-      # Create dataframes for differences
-      TZ_diff_df <- as.data.frame(TZ_diff_matrix)
-      FD_diff_df <- as.data.frame(FD_diff_matrix)
-      
-      # Assign appropriate column names
-      colnames(TZ_diff_df) <- colnames(merged_va_t_fd[, tz_columns])
-      colnames(FD_diff_df) <- colnames(merged_va_t_fd[, final_demand_columns])
-      
-      # Combine the differences into the original dataframe structure
-      difference_df <- merged_va_t_fd
-      difference_df[, tz_columns] <- TZ_diff_df
-      difference_df[, final_demand_columns] <- FD_diff_df
-      
-      #Save the difference dataframe as a CSV file
-      output_diff_file <- file.path(base_dir, paste0(year, "_", type, "_IOT_difference.csv"))
-      write_csv(difference_df, output_diff_file)
-      message("Difference file saved as: ", output_diff_file)
+      # Save the final adjusted dataset
+      output_diff_file <- file.path(base_dir, paste0(year, "_", type, "_IOT.csv"))
+      write_csv(merged_va_t_fd, output_diff_file)
+      message("IOT file saved as: ", output_diff_file)
       
       #rename column names with sector_countrycode
       primary_input_rows <- merged_va_t_fd %>% filter(Industry == "Primary input")
@@ -452,11 +498,11 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
       repeated_country_codes <- rep(country_codes, each = 26, length.out = 4915)
       repeated_industries <- rep(sector, length.out = 4915)
       new_column_names <- paste0(repeated_country_codes, "_", repeated_industries)
-      
+
       colnames(non_primary_input_rows)[4:4918] <- new_column_names
       colnames(primary_input_rows)[4:4918] <- new_column_names
       merged_va_t_fd <- bind_rows(non_primary_input_rows, primary_input_rows)
-      
+
       #join agriculture and fishing columns together
       agric_fish_columns <- grep("Agriculture|Fishing", colnames(merged_va_t_fd), value = TRUE)
       country_codes <- unique(sub("_.*", "", agric_fish_columns))
@@ -467,7 +513,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
       summed_agric_fish_df <- as.data.frame(do.call(cbind, summed_agric_fish))
       colnames(summed_agric_fish_df) <- paste0(country_codes, "_Agriculture")
       merged_va_t_fd <- merged_va_t_fd[, !colnames(merged_va_t_fd) %in% agric_fish_columns]
-      
+
       #loop through country code to insert calculated columns in their positions
       for (i in seq_along(country_codes)) {
         country <- country_codes[i]
@@ -476,17 +522,17 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         insert_position <- if (length(country_positions) > 0) min(country_positions) else ncol(merged_va_t_fd) + 1
         merged_va_t_fd <- add_column(merged_va_t_fd, !!paste0(country, "_Agriculture") := new_col, .before = insert_position)
       }
-      
+
       #Separate "Primary input" rows before the loop
        primary_input_rows <- merged_va_t_fd %>% filter(Industry == "Primary input")
        non_primary_input_rows <- merged_va_t_fd %>% filter(Industry != "Primary input")
-       
+
       final_merged_df <- data.frame()
       unique_countries <- unique(non_primary_input_rows$country)
-       
+
       for (countryname in unique_countries) {
          country_data <- non_primary_input_rows %>% filter(country == countryname)
-         
+
       # Sum up agriculture and fishing data for the current country
          combined_fish_agric <- country_data %>%
            filter(sector %in% c("Agriculture", "Fishing")) %>%
@@ -495,12 +541,12 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
          combined_fish_agric$Industry <- "Industries"
          combined_fish_agric$country <- countryname
          country_data <- bind_rows(combined_fish_agric, country_data %>% filter(!sector %in% c("Agriculture", "Fishing")))
-         final_merged_df <- bind_rows(final_merged_df, country_data) %>% 
+         final_merged_df <- bind_rows(final_merged_df, country_data) %>%
           select(sector, Industry, country, everything())
        }
       merged_va_t_fd <- bind_rows(final_merged_df, primary_input_rows)
-      
-      
+
+
       #join wholesale and retail columns together
       wholesale_retail_columns <- grep("Wholesale Trade|Retail Trade", colnames(merged_va_t_fd), value = TRUE)
       country_codes <- unique(sub("_.*", "", wholesale_retail_columns))
@@ -511,7 +557,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
       summed_wholesale_retail_df <- as.data.frame(do.call(cbind, summed_wholesale_retail))
       colnames(summed_wholesale_retail_df) <- paste0(country_codes, "_Wholesale and retail trade")
       merged_va_t_fd <- merged_va_t_fd[, !colnames(merged_va_t_fd) %in% wholesale_retail_columns]
-      
+
       #loop through country code to insert calculated columns in their positions
       for (i in seq_along(country_codes)) {
         country <- country_codes[i]
@@ -520,17 +566,17 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         insert_position <- if (length(country_positions) > 0) min(country_positions) else ncol(merged_va_t_fd) + 1
         merged_va_t_fd <- add_column(merged_va_t_fd, !!paste0(country, "_Wholesale and retail trade") := new_col, .before = insert_position)
       }
-      
+
       #Separate "Primary input" rows before the loop
       primary_input_rows <- merged_va_t_fd %>% filter(Industry == "Primary input")
       non_primary_input_rows <- merged_va_t_fd %>% filter(Industry != "Primary input")
-      
+
       final_merged_df <- data.frame()
       unique_countries <- unique(non_primary_input_rows$country)
-      
+
       for (countryname in unique_countries) {
         country_data <- non_primary_input_rows %>% filter(country == countryname)
-        
+
         # Sum up Wholesale and retail trade data for the current country
         combined_fish_agric <- country_data %>%
           filter(sector %in% c("Wholesale Trade", "Retail Trade")) %>%
@@ -539,42 +585,42 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         combined_fish_agric$Industry <- "Industries"
         combined_fish_agric$country <- countryname
         country_data <- bind_rows(combined_fish_agric, country_data %>% filter(!sector %in% c("Wholesale Trade", "Retail Trade")))
-        final_merged_df <- bind_rows(final_merged_df, country_data) %>% 
+        final_merged_df <- bind_rows(final_merged_df, country_data) %>%
           select(Industry, sector, country, everything())
       }
       merged_va_t_fd <- bind_rows(final_merged_df, primary_input_rows)
-      
+
       insert_position <- which(colnames(merged_va_t_fd) == "ZWE_Re-export & Re-import")
       row_agriculture_data <- merged_va_t_fd$ROW_Agriculture
       merged_va_t_fd <- merged_va_t_fd %>% select(-ROW_Agriculture)
       merged_va_t_fd <- add_column(merged_va_t_fd, ROW_Agriculture = row_agriculture_data, .after = insert_position)
-      
+
       # Define industry codes
       sector_code <- c("Z45T47", "Z01T03", "Z05T06_Z09", "Z10T12", "Z13T15", "Z16_Z17T18", "Z19_Z23",
                        "Z24_Z25", "Z26_Z29", "Z30", "Z31T33", "ZC37", "Z35T39", "Z41T43", "Z41T45",
-                       "Z49T52", "Z55T56", "Z58T60_Z62T63", "Z64T66_Z69T82", "Z84",
+                       "Z49T53", "Z55T56", "Z58T60_Z62T63", "Z64T66_Z69T82", "Z84",
                        "Z85_Z86T88", "Z97T98", "ZS94_96", "Z99")
-      
+
       # Add `code` column, repeating as needed
       merged_va_t_fd <- merged_va_t_fd %>%
         mutate(code = rep(sector_code, length.out = nrow(merged_va_t_fd))) %>%
         select(Industry, sector, country, code, everything())
-      
+
       # Adjust column names to avoid duplicates
       new_colnames <- rep(sector_code, length.out = 4540)
       colnames(merged_va_t_fd)[5:4540] <- paste0(merged_va_t_fd$country,"_", new_colnames)
-      
+
       # Separate `Primary input` and non-primary input rows
       primary_input_rows <- merged_va_t_fd %>% filter(Industry == "Primary input")
       non_primary_input_rows <- merged_va_t_fd %>% filter(Industry != "Primary input")
-      
+
       # Process adjustments for VA rows
       adjusted_VA <- data.frame()
       unique_countries <- unique(primary_input_rows$country)
-     
+
       for (countryname in unique_countries) {
         country_data <- primary_input_rows %>% filter(country == countryname)
-        
+
         # Sum up Consumption of fixed capital and Net operating surplus
         combined_gos <- country_data %>%
           filter(sector %in% c("Consumption of fixed capital K.1", "Net operating surplus B.2n")) %>%
@@ -583,82 +629,54 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
         combined_gos$Industry <- "Primary input"
         combined_gos$country <- countryname
         combined_gos$code <- "VGOPS"
-        
+
         # Add combined GOS data back to `country_data`
         country_data <- bind_rows(combined_gos, country_data %>% filter(
           !sector %in% c("Consumption of fixed capital K.1", "Net operating surplus B.2n")))
-        
+
         # minus Subsidies on production from Taxes on production
-        combined_taxes <- country_data %>%
-          filter(sector %in% c("Taxes on production D.29", "Subsidies on production D.39")) %>%
-          summarise(across(where(is.numeric), ~ diff(.x, na.rm = TRUE))) 
+        taxes <- country_data %>%
+          filter(sector == "Taxes on production D.29") %>%
+          select(where(is.numeric))
+        
+        subsidies <- country_data %>%
+          filter(sector == "Subsidies on production D.39") %>%
+          select(where(is.numeric))
+        
+        combined_taxes <- taxes - subsidies
         combined_taxes$sector <- "Output taxes"
         combined_taxes$Industry <- "Primary input"
         combined_taxes$country <- countryname
         combined_taxes$code <- "VOTXSplus"
-        
+
         # Add combined taxes data back to `country_data`
         country_data <- bind_rows(combined_taxes, country_data %>% filter(
           !sector %in% c("Taxes on production D.29", "Subsidies on production D.39")))
-        
+
         adjusted_VA <- bind_rows(adjusted_VA, country_data) %>%
           select(Industry, sector, country, code, everything())
       }
-      
+
       # Combine adjusted VA with non-primary rows and assign `code` for specific sectors
       merged_va_t_fd <- bind_rows(non_primary_input_rows, adjusted_VA) %>%
         mutate(code = ifelse(sector == "Compensation of employees D.1", "VLABR", code)) %>%
         filter(sector != "Net mixed income B.3n")
       
-      #...................Reapply RAS algorithm to the adjusted IOT...............................
+      # # Rename Taxes on production and remove subsidies
+      # merged_va_t_fd <- merged_va_t_fd %>%
+      #   mutate(code = ifelse(sector == "Taxes on production D.29", "VOTXSplus", code)) %>%
+      #   filter(sector != "Subsidies on production D.39")
+
+      #Save the  dataframe as a CSV file # to be removed
+      output_diff_file <- file.path(base_dir, paste0(year, "_", type, "_IOT1.csv"))
+      write_csv(merged_va_t_fd, output_diff_file)
+      message("Difference file saved as: ", output_diff_file)
       
+      #...................calculate total import and export.......................................................................
       #Extract the TZ columns and convert to matrix
       pattern <- paste(sector_code, collapse = "|")
       tz_columns <- grep(pattern, colnames(merged_va_t_fd), value = TRUE)
-      TZ_matrix <- as.matrix(merged_va_t_fd[, tz_columns])
-      target_row_sums <- merged_va_t_fd$gross_output_xout
-      target_col_sums_TZ <- merged_va_t_fd$gross_output_xout[1:ncol(TZ_matrix)]
-      
-      # Apply the RAS algorithm to adjust TZ columns
-      adjusted_TZ_matrix <- ras_algorithm(TZ_matrix, rowSums(TZ_matrix), target_col_sums_TZ)
-      merged_va_t_fd[, tz_columns] <- adjusted_TZ_matrix
-      
-      #Adjust the FD columns to match the residuals after TZ adjustment
-      FD_matrix <- as.matrix(merged_va_t_fd[, final_demand_columns])
-      residual_row_sums <- target_row_sums - rowSums(adjusted_TZ_matrix)
-      FD_row_sums <- rowSums(FD_matrix)
-      scaling_factors <- ifelse(FD_row_sums == 0, 0, residual_row_sums / FD_row_sums)
-      adjusted_FD_matrix <- diag(scaling_factors) %*% FD_matrix
-      merged_va_t_fd[, final_demand_columns] <- adjusted_FD_matrix
-      
-      #......................Difference between original and adjusted matrices....................
-      
-      # Calculate the difference for TZ columns
-      TZ_diff_matrix <- TZ_matrix - adjusted_TZ_matrix
-      
-      # Calculate the difference for FD columns
-      FD_diff_matrix <- FD_matrix - adjusted_FD_matrix
-      
-      # Create dataframes for differences
-      TZ_diff_df <- as.data.frame(TZ_diff_matrix)
-      FD_diff_df <- as.data.frame(FD_diff_matrix)
-      
-      # Assign appropriate column names
-      colnames(TZ_diff_df) <- colnames(merged_va_t_fd[, tz_columns])
-      colnames(FD_diff_df) <- colnames(merged_va_t_fd[, final_demand_columns])
-      
-      # Combine the differences into the original dataframe structure
-      difference_df <- merged_va_t_fd
-      difference_df[, tz_columns] <- TZ_diff_df
-      difference_df[, final_demand_columns] <- FD_diff_df
-      
-      #Save the difference dataframe as a CSV file
-      output_diff_file <- file.path(base_dir, paste0(year, "_", type, "_IOT2_difference.csv"))
-      write_csv(difference_df, output_diff_file)
-      message("Difference file saved as: ", output_diff_file)
- 
-      #...................calculate total import and export.......................................................................
-      
+
       # Function to calculate sum for TZ matrix and Final_demand excluding country-specific columns
       calculate_sum <- function(row, country_col, sum_cols) {
         country <- row[[country_col]]
@@ -684,7 +702,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
 
       # Add zeros to the column 'import_from_y' after row 4538
        merged_va_t_fd <- merged_va_t_fd %>%
-         mutate(import_from_companies = ifelse(row_number() > 4538, 0, import_from_companies))
+         mutate(import_from_companies = ifelse(row_number() > 4538, 0, import_from_companies)) # to add nan
 
       #  Function to calculate imports from final consumers
       calculate_imports <- function(df) {
@@ -692,7 +710,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
          df$Import_from_Final_Consumers <- 0
          unique_sectors <- unique(df$sector)
          unique_countries <- unique(df$country)
-      
+
         # Loop through each sector
         for (Sector in unique_sectors) {
 
@@ -712,7 +730,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
             for (other_country in unique_countries) {
               if (other_country != country) {
                 # Calculate the row sums for other countries' columns related to the current country
-                other_country_sum <- rowSums(sector_data[sector_data$country == other_country, 
+                other_country_sum <- rowSums(sector_data[sector_data$country == other_country,
                                               country_columns, drop = FALSE], na.rm = TRUE)
 
                 # Add the sum to the import sum
@@ -733,7 +751,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
 
       # Add zeros after row 4538
       merged_va_t_fd <- merged_va_t_fd %>%
-        mutate(Import_from_Final_Consumers = ifelse(row_number() > 4538, 0, Import_from_Final_Consumers))
+        mutate(Import_from_Final_Consumers = ifelse(row_number() > 4538, 0, Import_from_Final_Consumers))# to add nan
 
       # Calculate total import and modify dataframe
       merged_va_t_fd <- merged_va_t_fd %>%
@@ -742,32 +760,259 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
           Year = year
         ) %>%
         select(
-          Industry, sector, country, Year, everything()
-        ) %>% 
-        # Rename and sum final demand columns
-        select(-matches("Final_demand_P.53")) %>% 
+          Industry, sector, country, Year, everything())%>%
+          select(-c(
+                    export_to_companies,
+                    export_to_foreign_Consumers,
+                    gross_output,
+                    import_from_companies,
+                    Import_from_Final_Consumers
+                  )
+                 ) %>%
+        # slice(-4537) %>%
+         rename(YEXP=Total_Export,
+                YIMP=total_import)
+
+      # check the difference btw rolsum and colsum before and after RAS
+
+      #...................Reapply RAS algorithm to the adjusted IOT...............................
+
+      #Extract the TZ columns and convert to matrix
+      pattern <- paste(sector_code, collapse = "|")
+      tz_columns <- grep(pattern, colnames(merged_va_t_fd), value = TRUE)
+      TZ_matrix <- as.matrix(merged_va_t_fd[, tz_columns])
+      target_row_sums <- merged_va_t_fd$gross_output_xout
+      target_col_sums_TZ <- merged_va_t_fd$gross_output_xout[1:ncol(TZ_matrix)]
+
+      # Apply the RAS algorithm to adjust TZ columns
+      adjusted_TZ_matrix <- ras_algorithm(TZ_matrix, rowSums(TZ_matrix), target_col_sums_TZ)
+      
+      # ......Retain the original signs......
+      adjusted_TZ_matrix <- sign(TZ_matrix) * abs(adjusted_TZ_matrix)
+      
+      # Update the dataframe with adjusted TZ columns
+      merged_va_t_fd[, tz_columns] <- adjusted_TZ_matrix
+      
+      #Calculate residuals after TZ adjustment
+      residual_row_sums <- target_row_sums - rowSums(adjusted_TZ_matrix)
+      
+      FD_matrix <- as.matrix(merged_va_t_fd[, final_demand_columns])
+      FD_row_sums <- rowSums(FD_matrix)
+      
+      # Store the original FD_matrix for applying constraints later
+      original_FD_matrix <- FD_matrix
+      
+      # Separate positive and negative components
+      FD_positive <- FD_matrix
+      FD_negative <- FD_matrix
+      
+      # Set negative values in the positive matrix to 0
+      FD_positive[FD_matrix < 0] <- 0
+      
+      # Set positive values in the negative matrix to 0
+      FD_negative[FD_matrix > 0] <- 0
+      
+      #Compute scaling factors for positive and negative components
+      positive_row_sums <- rowSums(FD_positive)
+      negative_row_sums <- rowSums(FD_negative)
+      
+      scaling_factors_positive <- ifelse(
+        positive_row_sums == 0 & residual_row_sums == 0,
+        1,
+        ifelse(
+          positive_row_sums == 0,
+          0,
+          residual_row_sums / (positive_row_sums + negative_row_sums)
+        )
+      )
+      
+      scaling_factors_negative <- ifelse(
+        positive_row_sums == 0 & residual_row_sums != 0,
+        residual_row_sums / negative_row_sums,  # Distribute residual proportionally among negative values
+        residual_row_sums / (positive_row_sums + negative_row_sums)   # Normal scaling
+      )
+      
+      # Avoid division by zero for negative_row_sums == 0
+      scaling_factors_negative[negative_row_sums == 0] <- 1
+      
+      #Scale positive and negative components while retaining signs
+      adjusted_FD_positive <- diag(scaling_factors_positive) %*% FD_positive
+      adjusted_FD_negative <- diag(scaling_factors_negative) %*% FD_negative
+      
+      # Combine adjusted positive and negative parts
+      adjusted_FD_matrix <- adjusted_FD_positive + adjusted_FD_negative
+      
+      # Apply the -/+ 2% constraint
+      constraint <- 0.02 
+      
+      adjusted_FD_matrix <- pmax(adjusted_FD_matrix, original_FD_matrix * (1 - constraint))
+      adjusted_FD_matrix <- pmin(adjusted_FD_matrix, original_FD_matrix * (1 + constraint))
+      
+      # Retain the original signs
+      adjusted_FD_matrix <- sign(FD_matrix) * abs(adjusted_FD_matrix)
+      
+      # Update the FD matrix in the dataset
+      merged_va_t_fd[, final_demand_columns] <- adjusted_FD_matrix
+      
+      #Save IOT table
+      output_final <- file.path(base_dir, paste0(year, "_", type, "_IOT2.csv"))
+      write_csv(merged_va_t_fd, output_final)
+      message("Updated IOT after applying RAS saved as: ", output_final)
+
+      #......................Difference between original and adjusted matrices....................
+
+      # Calculate the difference for TZ columns
+      TZ_diff_matrix <- ((adjusted_TZ_matrix - TZ_matrix)/TZ_matrix)*100
+
+      # Calculate the difference for FD columns
+      FD_diff_matrix <- ((adjusted_FD_matrix - FD_matrix)/ FD_matrix)*100
+
+      # Create dataframes for differences
+      TZ_diff_df <- as.data.frame(TZ_diff_matrix)
+      FD_diff_df <- as.data.frame(FD_diff_matrix)
+
+      # Assign appropriate column names
+      colnames(TZ_diff_df) <- colnames(merged_va_t_fd[, tz_columns])
+      colnames(FD_diff_df) <- colnames(merged_va_t_fd[, final_demand_columns])
+
+      # Combine the differences into the original dataframe structure
+      difference_df <- merged_va_t_fd
+      difference_df[, tz_columns] <- TZ_diff_df
+      difference_df[, final_demand_columns] <- FD_diff_df
+
+      #Save the difference dataframe as a CSV file
+      output_diff_file <- file.path(base_dir, paste0(year, "_", type, "_IOT_difference_final.csv"))
+      write_csv(difference_df, output_diff_file)
+      message("Difference file saved as: ", output_diff_file)
+
+
+      #=======================================================
+      # Extract household final consumption and save separately
+      #=======================================================
+      countrycode <- read_csv("C:/Users/Nkoro/Food and Agriculture Organization/ESSDC - Data Generation and Capacity Building WorkSpace - EORA data/Full Eora/countrycode.csv")
+
+      household_final_consumption <- merged_va_t_fd %>%
+        select(Industry, sector, country, Year, code, matches("Final_demand_P\\.3h")) %>%
+        left_join(countrycode, by = c("country" = "country_code"))
+
+      # Identify unique countries from the country column
+      unique_countries <- unique(household_final_consumption$country)
+
+      household_final_consumption <- household_final_consumption %>%
+        rowwise() %>%
+        mutate(across(
+          -c(Industry, sector, country, Year, code, Country),
+          ~ ifelse(str_detect(cur_column(), country), ., NA)
+        ))
+
+      household_final_consumption <- as.data.frame(household_final_consumption)
+
+      household_final_consumption <- household_final_consumption %>%
+        pivot_longer(
+          cols = -c(Industry, sector, country, Year, code, Country),
+          names_to = "COL",
+          values_to = "var4"
+        ) %>%
+        rename(
+          ROW = code,
+          YEAR = Year,
+          COUNTRY = country,
+          COUNTRYCODE = Country
+        ) %>%
+        select(YEAR, COUNTRY, COUNTRYCODE, ROW, var4) %>%
+        # mutate(var4 = round(var4, 2)) %>%
+        filter(!is.na(var4)) %>%
+        ungroup()
+
+      # Process Z01T03 (Agriculture)
+      share_agric <- read_csv("C:/Users/Nkoro/Food and Agriculture Organization/ESSDC - Data Generation and Capacity Building WorkSpace - EORA data/Full Eora/Agriculture_share.csv")
+      share_agric$year <- as.character(share_agric$year)
+
+        if ("Z01T03" %in% unique(household_final_consumption$ROW)) {
+          agric_data <- household_final_consumption %>%
+            filter(ROW == "Z01T03") %>%
+            left_join(
+              share_agric,
+              by = c("COUNTRYCODE" = "country", "YEAR" = "year")
+            ) %>%
+            mutate(
+              Z01T03_a = ifelse(!is.na(Z01T03_a), (Z01T03_a / 100) * var4, NA),
+              Z03 = ifelse(!is.na(Z03), (Z03 / 100) * var4, NA),
+              Z01T03_b = ifelse(!is.na(Z01T03_b), (Z01T03_b / 100) * var4, NA),
+              VFOB = ifelse(!is.na(Z01T03_b), (var4 - Z01T03_b), NA)
+            )
+        }
+
+      # Process Z10T12 (Food & Beverages)
+      share_food <- read_csv("C:/Users/Nkoro/Food and Agriculture Organization/ESSDC - Data Generation and Capacity Building WorkSpace - EORA data/Full Eora/food_beverages_share.csv")
+      share_food$year <- as.character(share_food$year)
+
+      if ("Z10T12" %in% unique(household_final_consumption$ROW)) {
+        food_data <- household_final_consumption %>%
+          filter(ROW == "Z10T12") %>%
+          left_join(
+            share_food,
+            by = c("COUNTRYCODE" = "country", "YEAR" = "year")
+          ) %>%
+          mutate(
+            Z10T12_a = ifelse(!is.na(Z10T12_a), (Z10T12_a / 100) * var4, NA),
+            Z10T12_b = ifelse(!is.na(Z10T12_b), (Z10T12_b / 100) * var4, NA),
+            Z10T12_c = ifelse(!is.na(Z10T12_c), (Z10T12_c / 100) * var4, NA),
+            VFOB = ifelse(!is.na(Z10T12_c), (var4 - Z10T12_c), 0)
+          )
+      }
+
+      # Combine processed data
+      combined_data <- bind_rows(
+        agric_data %>% select(COUNTRYCODE, YEAR, ROW, VFOB),
+        food_data %>% select(COUNTRYCODE, YEAR, ROW, VFOB)
+      )
+
+      # Perform the left_join and ensure VFOB_new is created
+      household_final_consumption <- household_final_consumption %>%
+        left_join(
+          combined_data,
+          by = c("COUNTRYCODE", "YEAR", "ROW"), 
+          suffix = c("_existing", "_new"))
+
+      #Save extracted dataset
+      output_dir <- "C:/Users/Nkoro/Food and Agriculture Organization/ESSDC - Data Generation and Capacity Building WorkSpace - EORA data/Full Eora/Trade_margin/Processed_Margin_Data"
+      dir_create(output_dir)
+      output_diff_file <- file.path(output_dir, paste0(year, "_", type, "FAH.csv"))
+      write_csv(household_final_consumption, output_diff_file)
+      message("Household file saved file saved as: ", output_diff_file)
+      
+      # Perform the left_join and ensure VFOB_new is created and create the FTAH
+      household_final_consumption <- household_final_consumption %>%
+        mutate(
+          VFOB = ifelse(
+            ROW == "Z01T03", VFOB, 
+            ifelse(ROW == "Z10T12", var4, 0)
+          )
+        )
+      
+      #Save extracted dataset
+      output_dir <- "C:/Users/Nkoro/Food and Agriculture Organization/ESSDC - Data Generation and Capacity Building WorkSpace - EORA data/Full Eora/Trade_margin/Processed_Margin_Data"
+      dir_create(output_dir)
+      output_diff_file <- file.path(output_dir, paste0(year, "_", type, "FTAH.csv"))
+      write_csv(household_final_consumption, output_diff_file)
+      message("Household file saved file saved as: ", output_diff_file)
+
+
+      #.......................Rename and sum final demand columns.............................
+      merged_va_t_fd <- merged_va_t_fd %>%
+        select(-matches("Final_demand_P.53")) %>%
         rename_with(
           ~ str_replace(., "Final_demand_P.3g", "YGOV"),
           matches("Final_demand_P.3g")
-        ) %>% 
-        rename(YEXP=Total_Export,
-               YIMP=total_import) %>% 
-        select(-c(
-                  gross_output_xout,
-                  export_to_companies,
-                  export_to_foreign_Consumers,
-                  gross_output,
-                  import_from_companies,
-                  Import_from_Final_Consumers
-                )
-               )
-      
-        # Extract unique country names from column names
-        unique_countries <- unique(gsub("_.*", "", colnames(merged_va_t_fd)))
-   
+        )
+
+      #Extract unique country names from column names
+      unique_countries <- unique(gsub("_.*", "", colnames(merged_va_t_fd)))
+
       for (country in unique_countries) {
         YINV_cols <- grep(
-          paste0("^", country, ".*_(Final_demand_P\\.51|Final_demand_P\\.52)"),
+          paste0("^", country, ".*_(Final_demand_P\\.51|Final_demand_P\\.52)"), 
           colnames(merged_va_t_fd),
           value = TRUE
         )
@@ -776,15 +1021,15 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
           colnames(merged_va_t_fd),
           value = TRUE
         )
-        
+
         # Sum the columns for "YINV_cols" and update the dataframe
         if (length(YINV_cols) > 0) {
           # Calculate the sum for "YINV"
           YINV_sum <- rowSums(select(merged_va_t_fd, all_of(YINV_cols)), na.rm = TRUE)
-          
+
           # Drop old "YINV" columns
           merged_va_t_fd <- merged_va_t_fd %>% select(-all_of(YINV_cols))
-          
+
           # Insert the new "YINV" column at the appropriate position
           country_positions <- grep(paste0("^", country, "_"), colnames(merged_va_t_fd))
           insert_position <- if (length(country_positions) > 0) min(country_positions) else ncol(merged_va_t_fd) + 1
@@ -794,23 +1039,23 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
             .before = insert_position
           )
         }
-        
+
         # Sum the columns for "YPCE" and update the dataframe
         if (length(YPCE_cols) > 0) {
           # Calculate the sum for "YPCE"
           YPCE_sum <- rowSums(select(merged_va_t_fd, all_of(YPCE_cols)), na.rm = TRUE)
-          
+
           # Drop old "YPCE" columns
           merged_va_t_fd <- merged_va_t_fd %>% select(-all_of(YPCE_cols))
-          
+
           # Insert the new "YPCE" column at the appropriate position
-          country_positions <- grep(paste0("^", country, "_"), 
+          country_positions <- grep(paste0("^", country, "_"),
                                     colnames(merged_va_t_fd))
-          
-          insert_position <- if (length(country_positions) > 0) 
-            min(country_positions) else 
+
+          insert_position <- if (length(country_positions) > 0)
+            min(country_positions) else
               ncol(merged_va_t_fd) + 1
-          
+
           merged_va_t_fd <- add_column(
             merged_va_t_fd,
             !!paste0(country, "_YPCE") := YPCE_sum,
@@ -818,51 +1063,54 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
           )
         }
       }
-      
+
       # Identify unique countries from the `country` column
       unique_countries <- unique(merged_va_t_fd$country)
       merged_va_t_fd <- merged_va_t_fd %>%
-      rowwise() %>%
-      mutate(across(-c(Industry, sector, country, Year, code, YIMP, YEXP), ~ ifelse(str_detect(cur_column(), country), ., 0)))
+        select(-gross_output_xout) %>%
+        rowwise() %>%
+        mutate(across(-c(Industry, sector, country, Year, code,YIMP, YEXP),
+                      ~ ifelse(str_detect(cur_column(), country), ., NA)))
       merged_va_t_fd <- as.data.frame(merged_va_t_fd)
-      
-      #Save IOT table
-      output_final <- file.path(base_dir, paste0(year, "_", type, "_IOT.csv"))
-      write_csv(merged_va_t_fd, output_final)
-      message("Updated input-output table with country and industry column names saved as: ", output_final)
-       
-      #Pivot the whole dataset into long formaty as required
+
       merged_va_t_fd <- merged_va_t_fd %>%
+        #remove rest of the world
       pivot_longer(
           cols = -c(
             Industry,
-            sector, 
-            country, 
-            Year, 
-            code), 
-            names_to = "COL",                              
-            values_to = "var5"                             
-          ) %>% 
+            sector,
+            country,
+            Year,
+            code),
+            names_to = "COL",
+            values_to = "var5"
+          ) %>%
         rename(ROW = code,
                YEAR = Year,
                COUNTRY = country
                ) %>%
         select(YEAR, COUNTRY, ROW, COL, var5) %>%
-        mutate(var5 = round(var5, 2)) %>% 
-        filter(var5 != 0,
-               COL != "Agriculture") %>% 
+        # mutate(var5 = round(var5, 2)) %>%
+         filter(!is.na(var5)) %>%
         rowwise() %>%
         mutate(
           COL = case_when(
-            str_detect(COL, "\\.\\d+_") ~ str_sub(COL, 7),  
-            str_detect(COL, "_") ~ str_sub(COL, 5),         
-            TRUE ~ COL          
+            str_detect(COL, "\\.\\d+_") ~ str_sub(COL, 7),
+            str_detect(COL, "_") ~ str_sub(COL, 5),
+            TRUE ~ COL
           )
         ) %>%
         ungroup()
-   
       
+      merged_va_t_fd <- merged_va_t_fd %>% 
+        left_join(countrycode, by= c("COUNTRY"= "country_code"))
       
+      merged_va_t_fd <- merged_va_t_fd %>% 
+        select(YEAR, Country, ROW, COL, var5) %>% 
+        rename("COUNTRY" = Country) %>% 
+        filter( COUNTRY != "") 
+
+
       #................Apply RAS to balance total export and total import....................
       
       #Extract the TZ columns and convert to matrix
@@ -870,7 +1118,7 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
       # tz_columns <- grep(pattern, colnames(merged_va_t_fd), value = TRUE)
       # TZ_matrix <- as.matrix(merged_va_t_fd[, tz_columns])
       # target_row_sums <- merged_va_t_fd$Total_Export
-      # target_col_sums_TZ <- merged_va_t_fd$Total_Export[1:ncol(TZ_matrix)]
+      # target_col_sums_TZ <- merged_va_t_fd$Total_import[1:ncol(TZ_matrix)]
       # 
       # # Apply the RAS algorithm to adjust TZ columns
       # adjusted_TZ_matrix <- ras_algorithm(TZ_matrix, rowSums(TZ_matrix), target_col_sums_TZ)
@@ -885,10 +1133,10 @@ process_txt_files <- function(txt_files, original_folder, year, zip_type) {
       # merged_va_t_fd[, final_demand_columns] <- adjusted_FD_matrix
 
       # Save the final dataset with the updated column names
-      output_final <- file.path(base_dir, paste0(year, "_", type, "_INPUT_OUTPUT.csv"))
-      write_csv(merged_va_t_fd, output_final)
+      output_final <- file.path(base_dir, paste0(year, "_", type, "_INPUT_OUTPUT.dta"))
+      write_dta(merged_va_t_fd, output_final)
       message("Updated input-output table with country and industry column names saved as: ", output_final)
-      
+
       # #................Difference between original and adjusted matrices..........................
       # 
       # # Calculate the difference for TZ columns
