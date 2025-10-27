@@ -1,3 +1,5 @@
+# Lines from 3 to 12 list applied libraries #
+
 library(fs)
 library(zip)
 library(readr)
@@ -8,7 +10,6 @@ library(tidyverse)
 library(janitor)
 library(readxl)
 library(haven)
-
 
 # Define the directory
 base_dir <- "C:\\Users\\Nkoro\\Food and Agriculture Organization\\ESSDC - Data Generation and Capacity Building WorkSpace - EORA data\\Eora26\\test"
