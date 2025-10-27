@@ -12,8 +12,8 @@ library(readxl)
 library(haven)
 
 # Define the directory
-base_dir <- "C:\\Users\\Nkoro\\Food and Agriculture Organization\\ESSDC - Data Generation and Capacity Building WorkSpace - EORA data\\Eora26\\test"
-setwd(base_dir)
+base_dir <- "C:\\Users\\Nkoro\\Food and Agriculture Organization\\ESSDC - Data Generation and Capacity Building WorkSpace - EORA data\\Eora26\\test" # this is the directory from the Code Author.Data are storaged at: "https://unfao.sharepoint.com/:f:/s/ESSDC/Egm7c-wP3wtOsmsBEQW7x-IBd6E8RX0o7S-6vRlRlPl3mw?e=VvEdmX", so this link should be set as directory and here should be added years different form 2007.  
+setwd(base_dir) 
 # List all folders in the directory
 folders <- dir_ls(base_dir, type = "directory")
 
